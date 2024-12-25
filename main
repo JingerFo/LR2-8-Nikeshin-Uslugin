@@ -1,0 +1,183 @@
+from flask import Flask, request, redirect, render_template, url_for, session, flash
+from flask_bootstrap import Bootstrap
+import sqlite3
+import matplotlib.pyplot as plt
+from io import BytesIO
+import base64
+import telebot
+
+
+from config import TOKEN
+bot = telebot.TeleBot(token=TOKEN)
+
+# Flask app
+app = Flask(__name__)
+app.secret_key = 'your_secret_key'
+Bootstrap(app)
+
+# Database initialization
+def init_db():
+    conn = sqlite3.connect('app.db')
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER PRIMARY KEY,
+                        username TEXT UNIQUE,
+                        password TEXT,
+                        role TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS messages (
+                        id INTEGER PRIMARY KEY,
+                        user_id INTEGER,
+                        message TEXT,
+                        response TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# Routes
+@app.route('/')
+def index():
+    if 'username' not in session:
+        return redirect(url_for('login'))
+    return redirect(url_for('dashboard'))
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        role = request.form['role']
+
+        hashed_password = generate_password_hash(password, method='sha256')
+
+        conn = sqlite3.connect('app.db')
+        cursor = conn.cursor()
+
+        # Сохранение пользователя с ролью
+        cursor.execute('INSERT INTO users (username, password, role) VALUES (?, ?, ?)', (username, hashed_password, role))
+        conn.commit()
+        conn.close()
+
+        flash('Registration successful! You can now log in.', 'success')
+        return redirect(url_for('login'))
+
+    return render_template('register.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+
+        conn = sqlite3.connect('app.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, password, role FROM users WHERE username = ?', (username,))
+        user = cursor.fetchone()
+        conn.close()
+
+        if user and check_password_hash(user[1], password):
+            session['user_id'] = user[0]
+            session['username'] = username
+            session['role'] = user[2]  # Сохраняем роль
+            flash('Login successful!', 'success')
+            return redirect(url_for('dashboard'))
+
+        flash('Invalid credentials. Please try again.', 'danger')
+
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.pop('username', None)
+    session.pop('role', None)
+    return redirect(url_for('login'))
+
+@app.route('/dashboard')
+def dashboard():
+    if 'username' not in session:
+        return redirect(url_for('login'))
+
+    role = session['role']
+
+    conn = sqlite3.connect('app.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM messages')
+    messages = cursor.fetchall()
+    conn.close()
+
+    return render_template('dashboard.html', role=role, messages=messages)
+
+@app.route('/edit/<int:message_id>', methods=['GET', 'POST'])
+def edit_message(message_id):
+    if 'username' not in session or session['role'] not in ['manager', 'admin']:
+        return redirect(url_for('login'))
+
+    conn = sqlite3.connect('app.db')
+    cursor = conn.cursor()
+
+    if request.method == 'POST':
+        new_response = request.form['response']
+        cursor.execute('UPDATE messages SET response = ? WHERE id = ?', (new_response, message_id))
+        conn.commit()
+        conn.close()
+        return redirect(url_for('dashboard'))
+
+    cursor.execute('SELECT * FROM messages WHERE id = ?', (message_id,))
+    message = cursor.fetchone()
+    conn.close()
+    return render_template('edit_message.html', message=message)
+
+@app.route('/stats')
+def stats():
+    if 'username' not in session or session['role'] != 'admin':
+        return redirect(url_for('login'))
+
+    conn = sqlite3.connect('app.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT created_at, COUNT(*) FROM messages GROUP BY created_at')
+    data = cursor.fetchall()
+    conn.close()
+
+    # Generate table data
+    table_data = data
+
+    # Generate chart
+    dates = [row[0] for row in data]
+    counts = [row[1] for row in data]
+    plt.figure()
+    plt.plot(dates, counts, marker='o')
+    plt.xlabel('Date')
+    plt.ylabel('Message Count')
+    plt.title('Messages per Day')
+    img = BytesIO()
+    plt.savefig(img, format='png')
+    img.seek(0)
+    chart_url = base64.b64encode(img.getvalue()).decode()
+    plt.close()
+
+    return render_template('stats.html', table_data=table_data, chart_url=chart_url)
+
+# Telegram bot handlers
+@bot.message_handler(func=lambda message: True)
+def handle_message(message):
+    user_id = message.from_user.id
+    user_message = message.text
+
+    conn = sqlite3.connect('app.db')
+    cursor = conn.cursor()
+
+    # Dummy response logic
+    response = f"You said: {user_message}"
+
+    # Save message to DB
+    cursor.execute('INSERT INTO messages (user_id, message, response) VALUES (?, ?, ?)',
+                   (user_id, user_message, response))
+    conn.commit()
+    conn.close()
+
+    bot.reply_to(message, response)
+
+if __name__ == '__main__':
+    app.run(debug=True)
+    bot.polling()
